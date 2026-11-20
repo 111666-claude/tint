@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"log"
@@ -222,13 +223,146 @@ func (pt *ProgressTracker) finishProgress() {
 		processed, pt.total, elapsed.Round(time.Millisecond))
 }
 
-// processImageWithShepardsMethod applies Shepard's Method to each pixel of the image concurrently
+// clampMaskWeight normalizes a mask weight to [0, 1].
+// Non-finite weights (NaN, ±Inf) and negative weights are treated as 0
+// (keep the original color); weights above 1 are clamped to 1 (full theme color).
+func clampMaskWeight(w float64) float64 {
+	if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 {
+		return 0
+	}
+	if w > 1 {
+		return 1
+	}
+	return w
+}
+
+// maskWeightAt returns the mask weight in [0, 1] for the image pixel at (x, y).
+// The mask may have a different origin than the image; coordinates are
+// translated so that the mask's top-left aligns with the image's top-left.
+// Pixels outside the mask bounds yield weight 0 (original color kept).
+func maskWeightAt(mask *image.Gray, imgBounds image.Rectangle, x, y int) float64 {
+	mb := mask.Bounds()
+	mx := x - imgBounds.Min.X + mb.Min.X
+	my := y - imgBounds.Min.Y + mb.Min.Y
+	return clampMaskWeight(float64(mask.GrayAt(mx, my).Y) / 255.0)
+}
+
+// blendTowardsTheme mixes the original (non-premultiplied) color with the
+// themed color according to the mask weight w in [0, 1]:
+// w == 0 keeps the original color, w == 1 gives the full themed color.
+// The original alpha is always preserved.
+func blendTowardsTheme(orig color.NRGBA, themed color.RGBA, w float64) color.NRGBA {
+	w = clampMaskWeight(w)
+	if w == 0 {
+		return orig
+	}
+	blend := func(o, t uint8) uint8 {
+		return uint8(math.Round(float64(o)*(1-w) + float64(t)*w))
+	}
+	return color.NRGBA{
+		R: blend(orig.R, themed.R),
+		G: blend(orig.G, themed.G),
+		B: blend(orig.B, themed.B),
+		A: orig.A,
+	}
+}
+
+// recolorPixel computes the output color for a single pixel. It is the only
+// place per-pixel decisions are made, so single-threaded and parallel runs
+// produce identical results.
+//
+// Without a mask the historical behavior is preserved exactly. With a mask,
+// colors are computed in non-premultiplied (NRGBA) space so semi-transparent
+// edge pixels keep both their color and alpha instead of darkening to black.
+func recolorPixel(
+	img image.Image,
+	mask *image.Gray,
+	paletteRGBAs []color.RGBA,
+	luminosity float64,
+	nearest int,
+	power float64,
+	bounds image.Rectangle,
+	x, y int,
+) color.Color {
+	if mask == nil {
+		originalRGBA := toRGBA(img.At(x, y))
+		if originalRGBA.A == 0 {
+			return color.Transparent
+		}
+		adjustedColor := applyLuminosity(originalRGBA, luminosity)
+		return shepardsMethodColor(adjustedColor, paletteRGBAs, nearest, power)
+	}
+
+	orig := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+	if orig.A == 0 {
+		return color.Transparent
+	}
+
+	adjustedColor := applyLuminosity(color.RGBA{R: orig.R, G: orig.G, B: orig.B, A: 255}, luminosity)
+	themed := toRGBA(shepardsMethodColor(adjustedColor, paletteRGBAs, nearest, power))
+
+	w := maskWeightAt(mask, bounds, x, y)
+	return blendTowardsTheme(orig, themed, w)
+}
+
+// processRows recolors the row range [startY, endY) of img into dst.
+func processRows(
+	img image.Image,
+	mask *image.Gray,
+	paletteRGBAs []color.RGBA,
+	luminosity float64,
+	nearest int,
+	power float64,
+	bounds image.Rectangle,
+	startY, endY int,
+	dst *image.RGBA,
+	progress *ProgressTracker,
+) {
+	pixelsProcessed := int64(0)
+	for y := startY; y < endY; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			dst.Set(x, y, recolorPixel(img, mask, paletteRGBAs, luminosity, nearest, power, bounds, x, y))
+			pixelsProcessed++
+		}
+
+		// Update progress every 10 rows or at last row
+		if progress != nil && ((y-startY)%10 == 0 || y == endY-1) {
+			progress.updateProgress(pixelsProcessed)
+			pixelsProcessed = 0
+		}
+	}
+	if progress != nil && pixelsProcessed > 0 {
+		progress.updateProgress(pixelsProcessed)
+	}
+}
+
+// processImageWithShepardsMethod applies Shepard's Method to each pixel of the
+// image concurrently. If mask is non-nil, its gray value per pixel controls
+// the blend between the original color and the themed color.
 func processImageWithShepardsMethod(
 	img image.Image,
 	palette []color.Color,
 	luminosity float64,
 	nearest int,
 	power float64,
+	mask *image.Gray,
+) *image.RGBA {
+	return processImageWithWorkers(img, palette, luminosity, nearest, power, mask, runtime.NumCPU(), true)
+}
+
+// processImageWithWorkers is the testable core of processImageWithShepardsMethod:
+// numWorkers controls parallelism and showProgress toggles the progress display.
+// The result is independent of numWorkers because each worker writes a disjoint
+// row range through the shared recolorPixel logic.
+func processImageWithWorkers(
+	img image.Image,
+	palette []color.Color,
+	luminosity float64,
+	nearest int,
+	power float64,
+	mask *image.Gray,
+	numWorkers int,
+	showProgress bool,
 ) *image.RGBA {
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
@@ -240,11 +374,16 @@ func processImageWithShepardsMethod(
 	}
 
 	// Initialize progress tracker
-	totalPixels := int64(width * height)
-	progress := NewProgressTracker(totalPixels)
+	var progress *ProgressTracker
+	if showProgress {
+		totalPixels := int64(width * height)
+		progress = NewProgressTracker(totalPixels)
+	}
 
 	// Determine number of workers based on CPU cores
-	numWorkers := runtime.NumCPU()
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
 	if numWorkers > height {
 		numWorkers = height // no more workers than rows
 	}
@@ -271,41 +410,16 @@ func processImageWithShepardsMethod(
 			// Create partial image buffer for this worker
 			partialImg := image.NewRGBA(image.Rect(bounds.Min.X, startY, bounds.Max.X, endY))
 
-			pixelsProcessed := int64(0)
-			for y := startY; y < endY; y++ {
-				for x := bounds.Min.X; x < bounds.Max.X; x++ {
-					originalColor := img.At(x, y)
-					originalRGBA := toRGBA(originalColor)
-
-					if originalRGBA.A == 0 {
-						partialImg.Set(x, y, color.Transparent)
-						continue
-					}
-
-					// Adjust luminosity and apply Shepard's method
-					adjustedColor := applyLuminosity(originalRGBA, luminosity)
-					finalColor := shepardsMethodColor(adjustedColor, paletteRGBAs, nearest, power)
-					partialImg.Set(x, y, finalColor)
-
-					pixelsProcessed++
-				}
-
-				// Update progress every 10 rows or at last row
-				if (y-startY)%10 == 0 || y == endY-1 {
-					progress.updateProgress(pixelsProcessed)
-					pixelsProcessed = 0
-				}
-			}
-			if pixelsProcessed > 0 {
-				progress.updateProgress(pixelsProcessed)
-			}
+			processRows(img, mask, paletteRGBAs, luminosity, nearest, power, bounds, startY, endY, partialImg, progress)
 
 			partialImages[id] = partialImg
 		}(workerID)
 	}
 
 	wg.Wait()
-	progress.finishProgress()
+	if progress != nil {
+		progress.finishProgress()
+	}
 
 	// Merge partial images into final image
 	newImg := image.NewRGBA(bounds)
@@ -380,6 +494,64 @@ func decodeAndValidateImage(imagePath string, themeAndFlavor string, luminosity 
 	}
 
 	return img, format, nil
+}
+
+// loadMask opens, decodes, and validates a grayscale mask image. The mask's
+// gray value per pixel controls how strongly the theme color is applied
+// (0 = keep original, 255 = full theme color). The mask must have the same
+// width and height as the input image, but may have a different origin.
+func loadMask(maskPath string, imgBounds image.Rectangle) (*image.Gray, error) {
+	// Open file
+	file, err := os.Open(maskPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open mask file '%s': %v", maskPath, err)
+	}
+	defer file.Close()
+
+	// Get file info
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("cannot get file info for mask '%s': %v", maskPath, err)
+	}
+
+	// Check file size
+	if fileInfo.Size() > 100*1024*1024 {
+		return nil, fmt.Errorf("mask file '%s' is too large (%.2f MB). Maximum size is 100 MB",
+			maskPath, float64(fileInfo.Size())/(1024*1024))
+	}
+
+	// Decode mask
+	maskImg, format, err := image.Decode(file)
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode mask '%s': %v. Must be a valid JPEG or PNG", maskPath, err)
+	}
+	if format != "jpeg" && format != "png" {
+		return nil, fmt.Errorf("unsupported mask format '%s'. Only JPEG and PNG are supported", format)
+	}
+
+	// Check dimensions
+	mb := maskImg.Bounds()
+	if mb.Dx() == 0 || mb.Dy() == 0 {
+		return nil, fmt.Errorf("mask '%s' is empty (%dx%d)", maskPath, mb.Dx(), mb.Dy())
+	}
+	if mb.Dx() > MaxImageDimension || mb.Dy() > MaxImageDimension {
+		return nil, fmt.Errorf("mask dimensions too large (%dx%d). Max is %d", mb.Dx(), mb.Dy(), MaxImageDimension)
+	}
+	if mb.Dx()*mb.Dy() > MaxImagePixels {
+		return nil, fmt.Errorf("mask has too many pixels (%d). Max is %d", mb.Dx()*mb.Dy(), MaxImagePixels)
+	}
+
+	// The mask must cover the image exactly (origin may differ)
+	if mb.Dx() != imgBounds.Dx() || mb.Dy() != imgBounds.Dy() {
+		return nil, fmt.Errorf("mask size (%dx%d) does not match image size (%dx%d)",
+			mb.Dx(), mb.Dy(), imgBounds.Dx(), imgBounds.Dy())
+	}
+
+	// Convert to grayscale, preserving the mask's own bounds/origin
+	gray := image.NewGray(mb)
+	draw.Draw(gray, mb, maskImg, mb.Min, draw.Src)
+
+	return gray, nil
 }
 
 // getOutputExtension determines the output file extension based on input format and output path
@@ -505,6 +677,7 @@ func main() {
 	var imagePath string
 	var themeAndFlavor string
 	var outputPath string
+	var maskPath string
 	var luminosity float64
 	var nearest int
 	var power float64
@@ -522,6 +695,9 @@ func main() {
 
 	flag.StringVar(&outputPath, "output", "", "Path for the output image (default: <input_filename>_themed_<theme-flavor>.<input_format>)")
 	flag.StringVar(&outputPath, "o", "", "Shorthand for -output")
+
+	flag.StringVar(&maskPath, "mask", "", "Path to a grayscale mask image (optional). Mask intensity blends the original color with the themed color (black = keep original, white = full theme). Must match the image size.")
+	flag.StringVar(&maskPath, "m", "", "Shorthand for -mask")
 
 	flag.BoolVar(&listThemesFlag, "list-themes", false, "List all available themes and their flavors")
 	flag.BoolVar(&listThemesFlag, "l", false, "Shorthand for -list-themes")
@@ -578,6 +754,15 @@ func main() {
 		log.Fatalf("Error getting palette: %v", err)
 	}
 
+	// --- Load optional mask ---
+	var mask *image.Gray
+	if maskPath != "" {
+		mask, err = loadMask(maskPath, img.Bounds())
+		if err != nil {
+			log.Fatalf("Mask validation failed: %v", err)
+		}
+	}
+
 	// --- Load image ---
 	// (Already loaded above)
 
@@ -585,8 +770,11 @@ func main() {
 	log.Printf("Theme: %s", strings.ToLower(themeAndFlavor))
 	log.Printf("Shepard's Method: nearest = %d, power = %.1f, luminosity = %.1f", nearest, power, luminosity)
 	log.Printf("Processing: '%s'", imagePath)
+	if mask != nil {
+		log.Printf("Mask: '%s'", maskPath)
+	}
 
-	processedImg := processImageWithShepardsMethod(img, paletteColors, luminosity, nearest, power)
+	processedImg := processImageWithShepardsMethod(img, paletteColors, luminosity, nearest, power, mask)
 
 	// --- Determine output path ---
 	outPath := outputPath
@@ -632,6 +820,14 @@ func setUsage() {
 	fmt.Fprintf(w, "  %s--output, -o <PATH>%s\n", bold, reset)
 	fmt.Fprintf(w, "\tPath for the output image.\n")
 	fmt.Fprintf(w, "\t(Default: <input_filename>_themed_<theme-flavor>.<input_format>)\n\n")
+
+	// Mask
+	fmt.Fprintf(w, "  %s--mask, -m <PATH>%s\n", bold, reset)
+	fmt.Fprintf(w, "\tPath to a grayscale mask image (optional).\n")
+	fmt.Fprintf(w, "\tMask intensity blends the original color with the themed color:\n")
+	fmt.Fprintf(w, "\tblack keeps the original pixel, white applies the full theme color.\n")
+	fmt.Fprintf(w, "\tUseful to recolor only selected regions (e.g. clothing in a photo)\n")
+	fmt.Fprintf(w, "\twhile leaving skin and background untouched. Must match the image size.\n\n")
 
 	// Luminosity
 	fmt.Fprintf(w, "  %s--luminosity <FLOAT>%s\n", bold, reset)
